@@ -1,0 +1,643 @@
+以下は、**Manifest V3** 対応の Chrome 拡張機能として、  
+- 指定ドメイン（デフォルト: `twitter.com`）を 15 分（ユーザーが設定可能）連続閲覧したら  
+- **ローカル通知** ＋ **Discord Webhook への通知** を行い  
+- （オプション設定により）ページ上に警告オーバーレイを表示する  
+
+という一連の機能を実装した、**最小構成の「完成版」サンプルコード**です。
+
+> **注意**  
+> - 実際のご利用にあたっては、必要に応じてソースをカスタマイズしてください。  
+> - これはあくまでサンプルであり、デザインや細かなバリデーション等は簡略化しています。  
+
+---
+
+# ディレクトリ構成例
+
+```
+my-time-warner-extension/
+├── manifest.json
+├── background.js         // バックグラウンド（サービスワーカー）
+├── options.html
+├── options.js
+├── content-script.js
+├── icons/
+│    ├── icon16.png
+│    ├── icon48.png
+│    └── icon128.png
+└── (必要に応じて他ファイルやCSSなど)
+```
+
+## 1. `manifest.json`
+
+```jsonc
+{
+  "name": "TimeWarner Example",
+  "description": "Warns you when you've spent too long on certain sites (e.g. Twitter).",
+  "version": "1.0",
+  "manifest_version": 3,
+
+  // 拡張機能で利用する権限
+  "permissions": [
+    "storage",
+    "notifications",
+    "alarms",
+    "tabs"
+  ],
+
+  // 外部への fetch を許可するホスト権限 (Discord Webhookなど)
+  "host_permissions": [
+    "*://discord.com/api/*",
+    "*://*.discord.com/*"
+  ],
+
+  // Service Worker (バックグラウンド) のエントリーポイント
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  // オプション画面
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+
+  // コンテンツスクリプト（例として Twitter ドメイン）
+  // ※ ユーザーの設定ドメインに合わせたい場合は、runtime メッセージや
+  //    ディナミックインジェクトの仕組み等が必要になるため、ここでは
+  //    "twitter.com" を固定にしています。
+  "content_scripts": [
+    {
+      "matches": ["*://*.twitter.com/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  // 任意のアイコン
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
+```
+
+---
+
+## 2. バックグラウンドスクリプト: `background.js`
+
+- **サービスワーカー** として動作し、  
+  - **タブのアクティブ状態** や **ウィンドウのフォーカス変化** を監視して  
+  - 指定ドメインに 15 分（初期値）連続滞在すると、通知を行う  
+- **閲覧時間の累積** も簡易的に行い、`chrome.storage.local` に保存します。  
+- **Discord Webhook** への通知もここで実行。  
+- **コンテンツスクリプト** への「警告開始」メッセージ送信も行います（オプションでオーバーレイ）。
+
+```js
+/* background.js (Service Worker for Manifest V3) */
+
+const DEFAULT_OPTIONS = {
+  domain: "twitter.com",       // 監視対象ドメイン (ユーザー変更可能)
+  thresholdMinutes: 15,        // 連続閲覧閾値 (ユーザー変更可能)
+  discordWebhookUrl: "",       // Discord Webhook URL (任意)
+  enableDiscord: false,        // Discord通知を有効にするか
+  enableLocalNotif: true,      // Chromeローカル通知を有効にするか
+  enableOverlay: true,         // ページ上オーバーレイの警告を有効にするか
+  trackingEnabled: true        // 全体の計測オン/オフ
+};
+
+// 現在アクティブなタブの状態
+let currentTabId = null;
+let currentDomain = null;
+let sessionStartTime = null;
+
+// ドメイン別の累積閲覧時間 (分単位などで保存)
+let domainTimes = {};  // { "twitter.com": 累積分数, ... }
+
+// 直近に設定したアラーム名（1つだけ扱う想定）
+const ALARM_NAME = "TimeWarnerAlarm";
+
+/** =========================================
+ * ストレージからオプションを取得する
+ * ========================================= */
+async function getOptions() {
+  return new Promise((resolve) => {
+    chrome.storage.local.get(DEFAULT_OPTIONS, (items) => {
+      resolve(items);
+    });
+  });
+}
+
+/** =========================================
+ * ストレージにオプションを保存する (必要に応じて)
+ * ========================================= */
+async function setOptions(newOptions) {
+  return new Promise((resolve) => {
+    chrome.storage.local.set(newOptions, () => {
+      resolve();
+    });
+  });
+}
+
+/** =========================================
+ * 現在のアクティブタブ情報を更新＆セッション開始
+ * ========================================= */
+async function handleTabActivated(tabId) {
+  const opts = await getOptions();
+  if (!opts.trackingEnabled) {
+    // 計測OFFの場合は何もしない
+    clearAlarm();
+    currentTabId = null;
+    currentDomain = null;
+    sessionStartTime = null;
+    return;
+  }
+
+  // タブ情報を取得
+  chrome.tabs.get(tabId, (tab) => {
+    if (!tab || !tab.url) return;
+
+    // セッション終了処理 (前のタブから切り替わった場合)
+    endCurrentSession();
+
+    // 新しいアクティブタブ
+    currentTabId = tabId;
+    currentDomain = extractDomain(tab.url);
+    sessionStartTime = Date.now();
+
+    // もし監視対象ドメインなら、閾値分のアラームをセット
+    // ただし、ドメインがマッチした場合「連続閲覧」を開始
+    checkAndSetAlarm();
+  });
+}
+
+/** =========================================
+ * タブURLが更新された（同一タブ内でドメインが変わる）場合の処理
+ * ========================================= */
+function handleTabUpdated(tabId, changeInfo, tab) {
+  if (tabId !== currentTabId) return; // アクティブなタブ以外は無視
+  if (changeInfo.status === "complete" && tab.url) {
+    // 一旦セッション終了 -> 新URLでセッション開始
+    endCurrentSession();
+    currentDomain = extractDomain(tab.url);
+    sessionStartTime = Date.now();
+    checkAndSetAlarm();
+  }
+}
+
+/** =========================================
+ * ウィンドウフォーカスが変わった (Chrome非アクティブ含む)
+ * ========================================= */
+function handleWindowFocusChanged(windowId) {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) {
+    // Chromeが非アクティブになった(他アプリに移動等)
+    endCurrentSession();
+    clearAlarm();
+    currentTabId = null;
+    currentDomain = null;
+    sessionStartTime = null;
+  } else {
+    // アクティブ化したウィンドウのタブを取得
+    chrome.tabs.query({ active: true, windowId }, (tabs) => {
+      if (tabs.length > 0) {
+        handleTabActivated(tabs[0].id);
+      }
+    });
+  }
+}
+
+/** =========================================
+ * タブが閉じられた
+ * ========================================= */
+function handleTabRemoved(tabId, removeInfo) {
+  if (tabId === currentTabId) {
+    endCurrentSession();
+    clearAlarm();
+    currentTabId = null;
+    currentDomain = null;
+    sessionStartTime = null;
+  }
+}
+
+/** =========================================
+ * 連続閲覧タイマー用のアラームをセット
+ * ========================================= */
+async function checkAndSetAlarm() {
+  const opts = await getOptions();
+  if (!opts.trackingEnabled) return;
+
+  const domainToWatch = opts.domain;
+  if (currentDomain && currentDomain.includes(domainToWatch)) {
+    // 指定ドメインに該当: threshold 分後に1回だけアラーム
+    chrome.alarms.create(ALARM_NAME, {
+      delayInMinutes: parseFloat(opts.thresholdMinutes)
+    });
+  } else {
+    // 該当しなければアラーム解除
+    clearAlarm();
+  }
+}
+
+/** =========================================
+ * アラームをクリア
+ * ========================================= */
+function clearAlarm() {
+  chrome.alarms.clear(ALARM_NAME);
+}
+
+/** =========================================
+ * アラームが鳴った: 連続閲覧が閾値に達した
+ * ========================================= */
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== ALARM_NAME) return;
+
+  // いまも対象ドメインを見続けているか確認する
+  const opts = await getOptions();
+  if (!opts.trackingEnabled) return;
+
+  if (currentDomain && currentDomain.includes(opts.domain)) {
+    // 連続閲覧が確定したので通知を送る
+    if (opts.enableLocalNotif) {
+      createLocalNotification(opts);
+    }
+    if (opts.enableDiscord && opts.discordWebhookUrl) {
+      sendDiscordWebhook(opts);
+    }
+
+    if (opts.enableOverlay) {
+      // コンテンツスクリプトに「警告表示」メッセージを送る
+      // （アクティブタブIDが有効な場合のみ）
+      if (currentTabId !== null) {
+        chrome.tabs.sendMessage(currentTabId, { type: "TIME_EXCEEDED" });
+      }
+    }
+  }
+
+  // 必要があれば再度アラームをセットする／あるいは一度だけ通知で終了
+  // ここでは「一度通知したらリセット」する例
+  clearAlarm();
+});
+
+/** =========================================
+ * ローカル通知を生成
+ * ========================================= */
+function createLocalNotification(opts) {
+  chrome.notifications.create("timeWarnerNotification", {
+    type: "basic",
+    iconUrl: chrome.runtime.getURL("icons/icon48.png"),
+    title: "連続閲覧警告",
+    message: `${opts.domain} を ${opts.thresholdMinutes}分 以上見ています。休憩しませんか？`
+  });
+}
+
+/** =========================================
+ * Discord Webhook へ送信
+ * ========================================= */
+function sendDiscordWebhook(opts) {
+  fetch(opts.discordWebhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      content: `警告: ${opts.domain}を${opts.thresholdMinutes}分以上連続閲覧中です！`
+    })
+  }).catch((err) => console.error("Discord送信エラー:", err));
+}
+
+/** =========================================
+ * セッション終了処理: currentDomain の滞在時間を保存
+ * ========================================= */
+function endCurrentSession() {
+  if (!currentDomain || !sessionStartTime) return;
+  const durationMs = Date.now() - sessionStartTime;
+  const durationMin = Math.floor(durationMs / 1000 / 60);
+
+  // 累積時間を domainTimes に加算
+  if (!domainTimes[currentDomain]) {
+    domainTimes[currentDomain] = 0;
+  }
+  domainTimes[currentDomain] += durationMin;
+
+  // ストレージに保存しておく (都度上書き)
+  chrome.storage.local.set({ domainTimes });
+
+  // リセット
+  currentDomain = null;
+  sessionStartTime = null;
+}
+
+/** =========================================
+ * URL からドメインを抽出
+ * ========================================= */
+function extractDomain(urlString) {
+  try {
+    const u = new URL(urlString);
+    return u.hostname || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+/** =========================================
+ * イベントリスナー設定
+ * ========================================= */
+
+// 拡張機能がインストール/起動したときに domainTimes を読み込む
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.storage.local.get("domainTimes", (res) => {
+    domainTimes = res.domainTimes || {};
+  });
+});
+
+// Service Worker 起動時に domainTimes を読み込む (再起動対策)
+chrome.runtime.onStartup.addListener(() => {
+  chrome.storage.local.get("domainTimes", (res) => {
+    domainTimes = res.domainTimes || {};
+  });
+});
+
+// タブがアクティブ化した
+chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
+  handleTabActivated(tabId);
+});
+
+// タブ更新時 (URL遷移など)
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  handleTabUpdated(tabId, changeInfo, tab);
+});
+
+// ウィンドウフォーカス変化
+chrome.windows.onFocusChanged.addListener(handleWindowFocusChanged);
+
+// タブが閉じられた
+chrome.tabs.onRemoved.addListener(handleTabRemoved);
+```
+
+---
+
+## 3. オプションページ: `options.html`
+
+- ユーザーが「監視対象ドメイン」「閾値」「Discord Webhook URL」などを設定できるフォームです。  
+- 保存ボタンで `chrome.storage.local` に書き込み、読み込み時に反映。  
+- **全体の計測オン/オフ**、**Discord通知有効/無効**、**ローカル通知有効/無効**、**ページオーバーレイ表示 有効/無効** もチェックボックスで扱います。
+
+```html
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>TimeWarner - オプション設定</title>
+  <style>
+    body { font-family: sans-serif; margin: 16px; }
+    label { display: block; margin: 8px 0 4px; }
+    input[type="text"], input[type="number"] {
+      width: 250px;
+      padding: 4px;
+    }
+    .section { margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <h1>TimeWarner 設定</h1>
+
+  <div class="section">
+    <label>
+      <input type="checkbox" id="trackingEnabled" />
+      拡張機能による時間計測を有効にする
+    </label>
+  </div>
+
+  <div class="section">
+    <label>監視対象ドメイン (例: twitter.com)</label>
+    <input type="text" id="domain" />
+  </div>
+
+  <div class="section">
+    <label>連続閲覧閾値 (分)</label>
+    <input type="number" id="thresholdMinutes" min="1" />
+  </div>
+
+  <hr />
+
+  <div class="section">
+    <label>
+      <input type="checkbox" id="enableLocalNotif" />
+      ローカル通知を表示する
+    </label>
+    <label>
+      <input type="checkbox" id="enableOverlay" />
+      ページ上に警告オーバーレイを表示する
+    </label>
+  </div>
+
+  <div class="section">
+    <label>
+      <input type="checkbox" id="enableDiscord" />
+      Discord Webhook 通知を有効にする
+    </label>
+    <input type="text" id="discordWebhookUrl" placeholder="https://discord.com/api/webhooks/..." />
+  </div>
+
+  <button id="saveBtn">保存</button>
+  <div id="status" style="color: green; margin-top: 8px;"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>
+```
+
+---
+
+## 4. オプションスクリプト: `options.js`
+
+- 上記 `options.html` 内の入力フォームを扱い、  
+- 保存ボタン押下で `chrome.storage.local.set` し、  
+- ページ読込時に `chrome.storage.local.get` で既存値を反映する。
+
+```js
+/* options.js */
+
+document.addEventListener("DOMContentLoaded", async () => {
+  // デフォルト値
+  const DEFAULT_OPTIONS = {
+    domain: "twitter.com",
+    thresholdMinutes: 15,
+    discordWebhookUrl: "",
+    enableDiscord: false,
+    enableLocalNotif: true,
+    enableOverlay: true,
+    trackingEnabled: true
+  };
+
+  const domainInput = document.getElementById("domain");
+  const thresholdInput = document.getElementById("thresholdMinutes");
+  const discordWebhookInput = document.getElementById("discordWebhookUrl");
+  const enableDiscordCheckbox = document.getElementById("enableDiscord");
+  const enableLocalNotifCheckbox = document.getElementById("enableLocalNotif");
+  const enableOverlayCheckbox = document.getElementById("enableOverlay");
+  const trackingEnabledCheckbox = document.getElementById("trackingEnabled");
+  const saveBtn = document.getElementById("saveBtn");
+  const statusDiv = document.getElementById("status");
+
+  // ストレージから読み込み
+  chrome.storage.local.get(DEFAULT_OPTIONS, (res) => {
+    domainInput.value = res.domain || DEFAULT_OPTIONS.domain;
+    thresholdInput.value = res.thresholdMinutes || DEFAULT_OPTIONS.thresholdMinutes;
+    discordWebhookInput.value = res.discordWebhookUrl || DEFAULT_OPTIONS.discordWebhookUrl;
+    enableDiscordCheckbox.checked = !!res.enableDiscord;
+    enableLocalNotifCheckbox.checked = !!res.enableLocalNotif;
+    enableOverlayCheckbox.checked = !!res.enableOverlay;
+    trackingEnabledCheckbox.checked = !!res.trackingEnabled;
+  });
+
+  // 保存ボタン
+  saveBtn.addEventListener("click", () => {
+    const newOptions = {
+      domain: domainInput.value.trim(),
+      thresholdMinutes: parseFloat(thresholdInput.value) || 15,
+      discordWebhookUrl: discordWebhookInput.value.trim(),
+      enableDiscord: enableDiscordCheckbox.checked,
+      enableLocalNotif: enableLocalNotifCheckbox.checked,
+      enableOverlay: enableOverlayCheckbox.checked,
+      trackingEnabled: trackingEnabledCheckbox.checked
+    };
+
+    chrome.storage.local.set(newOptions, () => {
+      statusDiv.textContent = "設定を保存しました！";
+      setTimeout(() => { statusDiv.textContent = ""; }, 2000);
+    });
+  });
+});
+```
+
+---
+
+## 5. コンテンツスクリプト: `content-script.js`
+
+- Twitter（`twitter.com`）を開いている間、**バックグラウンドからのメッセージ**を受け取り、  
+  15 分連続閲覧超過時にオーバーレイ警告を表示します。  
+- ここでは、オプションの `enableOverlay` が有効になっている場合、  
+  サービスワーカー側から `TIME_EXCEEDED` メッセージが届いたら大きなポップアップを表示。  
+
+```js
+/* content-script.js */
+
+(function() {
+  // 既に挿入済みの場合は二重実行しない
+  if (window.__timeWarnerContentScriptInjected) return;
+  window.__timeWarnerContentScriptInjected = true;
+
+  console.log("[TimeWarner] Content script loaded on Twitter.");
+
+  // オーバーレイ要素を作成（非表示で待機）
+  const overlay = document.createElement("div");
+  overlay.id = "timeWarnerOverlay";
+  Object.assign(overlay.style, {
+    position: "fixed",
+    top: "0",
+    left: "0",
+    width: "100%",
+    height: "100%",
+    backgroundColor: "rgba(255,0,0,0.8)",
+    color: "#fff",
+    display: "none",
+    justifyContent: "center",
+    alignItems: "center",
+    fontSize: "24px",
+    zIndex: 99999999,
+    textAlign: "center",
+    padding: "50px"
+  });
+  overlay.innerHTML = `<div>
+    <h1>警告</h1>
+    <p>連続閲覧時間が閾値を超えました。休憩しましょう！</p>
+    <button id="timeWarnerCloseBtn" style="
+      margin-top: 20px; 
+      font-size: 18px; 
+      padding: 8px 16px;
+      cursor: pointer;
+    ">閉じる</button>
+  </div>`;
+
+  document.body.appendChild(overlay);
+
+  // 閉じるボタンでオーバーレイを非表示にする
+  const closeBtn = document.getElementById("timeWarnerCloseBtn");
+  closeBtn.addEventListener("click", () => {
+    overlay.style.display = "none";
+  });
+
+  // バックグラウンドからのメッセージを受け取る
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === "TIME_EXCEEDED") {
+      // オプションで enableOverlay が true の場合のみ表示したい場合は
+      // ここでストレージを参照する方法もあるが、簡易的にそのまま表示
+      console.log("[TimeWarner] TIME_EXCEEDED message received");
+      overlay.style.display = "flex";
+    }
+  });
+})();
+```
+
+- 上記では、**「連続閲覧超過」** の通知がバックグラウンドから飛んできたときに  
+  大きな赤いオーバーレイを全画面に出します。  
+- ボタンを押すと消えますが、ユーザーがそのままタブを見続けても再度出ることはありません。  
+  （再表示したい場合はアラームを再セットするロジックを加えるなどカスタマイズしてください。）
+
+---
+
+# 使い方の概要
+
+1. **フォルダを作成し、上記ファイルを配置**  
+   - `manifest.json`, `background.js`, `options.html`, `options.js`, `content-script.js`, `icons/` など。
+
+2. **ブラウザに拡張機能を読み込む**  
+   - Arc (Chromium) や Google Chrome で  
+     `拡張機能 → デベロッパーモード → パッケージ化されていない拡張機能を読み込む` から  
+     上記フォルダを選択。  
+
+3. **オプション画面で設定**  
+   - 監視したいドメイン（初期は `twitter.com`）、連続閲覧閾値（15 など）、Discord Webhook などを入力。  
+   - 「計測を有効にする」「ローカル通知を表示」「オーバーレイを表示」「Discord 通知を有効」等を必要に応じてオンにする。  
+
+4. **Twitter を開いて 15 分（初期設定）閲覧し続けると通知**  
+   - デスクトップ通知が表示され（`enableLocalNotif = true` の場合）  
+   - Discord Webhook が設定されていればチャンネルにメッセージが飛び  
+   - `enableOverlay = true` ならページにオーバーレイ警告が出る。  
+
+5. **ブラウザが非アクティブになる・他のタブに移動する**  
+   - 連続閲覧時間はリセットされるため、再度戻ってきてからまた 15 分連続しないと通知は発火しない。  
+
+6. **ドメインごとの累積閲覧時間**  
+   - バックグラウンドスクリプトで `domainTimes` に分刻みで保存され、`chrome.storage.local` に保持。  
+   - 必要に応じてオプション画面などで可視化（ランキング表示など）できます。
+
+---
+
+# 補足・拡張ポイント
+
+- **複数ドメイン** を同時に監視したい場合  
+  → `options.html` でリスト管理したり、バッジでループ処理したりする実装に拡張できます。  
+
+- **同じタブでドメインが切り替わる** 場合  
+  → `onUpdated` ハンドラで URL 変化を検出し、前ドメインを記録して新ドメインを開始する実装になっています。  
+
+- **連続閲覧時間のチェック方法**  
+  → 上記サンプルでは「指定ドメインがアクティブになったら `delayInMinutes` でアラーム → タブ移動やフォーカス喪失でアラーム解除」という単純なモデルです。厳密に秒単位で計算したい場合は、`setTimeout`+サービスワーカーの keepAlive や、`onFocusChanged` などイベントごとに都度差分を計算するアプローチも考えられます。  
+
+- **Slack Webhook 対応**  
+  → Discord Webhook 送信の箇所を少し変えるだけで同様に実装可能です。（`fetch` 先 URL と JSON ペイロードを Slack に合わせる）  
+
+- **UI の改善**  
+  → options.html を React や Vue.js などで作り込むと、より使いやすいインタラクティブな管理画面にできます。  
+
+- **エラー処理／バリデーション**  
+  → Webhook URL が無効な場合のエラーメッセージや、0 分や負数を入力された場合の制限など、実運用に合わせて追加してください。  
+
+- **Arc（Chromiumベース）でのインストール**  
+  → Chrome 拡張機能がそのまま使えます。Arc の「Extensions」設定から同様に読み込んでください。
+
+---
+
+以上のコードをまとめて配置し、拡張機能として読み込むだけで「Twitter を 15 分連続で見たときにローカル＆Discord へ通知し、画面オーバーレイを出す」仕組みが動作するはずです。  
+
+最小限のサンプル実装としてご活用いただき、必要に応じてカスタマイズしてください。どうぞご参考にしていただければ幸いです。
